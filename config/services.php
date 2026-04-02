@@ -35,4 +35,24 @@ return [
         ],
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Stock Market Data APIs
+    |--------------------------------------------------------------------------
+    |
+    | Alpha Vantage API for stock fundamental data
+    |
+    | Free tier: 5 calls/min = 7,200/day (more than enough with caching)
+    | Get free API key: https://www.alphavantage.co/
+    |
+    | Supports: Global stocks and indices
+    | Fundamental data: EPS, BookValue, ROE, DER, ProfitMargin
+    |
+    */
+
+    'alpha_vantage' => [
+        'key' => env('ALPHA_VANTAGE_KEY', 'demo'),
+        'base_url' => 'https://www.alphavantage.co',
+        'timeout' => 15,
+    ],
 ];
