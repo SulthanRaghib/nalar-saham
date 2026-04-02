@@ -31,14 +31,15 @@ class AssignGuestId
         // Add the guest_uuid cookie to the response if it wasn't previously set
         if (!$request->hasCookie('guest_uuid')) {
             $response->cookie(
-                name: 'guest_uuid',
-                value: $request->input('guest_uuid'),
-                minutes: 1440, // 24 hours
-                path: '/',
-                domain: null,
-                secure: config('app.env') === 'production',
-                httpOnly: false, // Allow JavaScript access for frontend tracking
-                sameSite: 'lax'
+                'guest_uuid',
+                $request->input('guest_uuid'),
+                1440,
+                '/',
+                null,
+                config('app.env') === 'production',
+                false,
+                false,
+                'lax'
             );
         }
 
