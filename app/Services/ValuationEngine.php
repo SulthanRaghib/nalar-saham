@@ -9,117 +9,151 @@ use Illuminate\Support\Facades\Log;
 /**
  * ValuationEngine
  *
- * Core financial valuation calculator using Benjamin Graham's principles.
- * Responsible for calculating intrinsic value and margin of safety metrics.
+ * Calculates intrinsic value using Benjamin Graham's principles.
+ * Handles edge cases: negative EPS, negative BVPS, loss-making companies.
+ *
+ * When Graham Number cannot be computed (negative EPS/BVPS), it falls back
+ * to PBV-based analysis and provides meaningful diagnostics instead of failing.
  */
 class ValuationEngine
 {
     /**
-     * Calculate Graham Number (Intrinsic Value using Graham's Formula)
+     * Full analysis: tries Graham Number first, falls back to PBV-based analysis.
      *
-     * Graham Number = √(22.5 × EPS × BVPS)
+     * Returns a structured result that ALWAYS provides a verdict,
+     * even for loss-making companies with negative fundamentals.
      *
-     * This is Benjamin Graham's formula for estimating a stock's intrinsic value.
-     * The constant 22.5 represents 15 times earnings × 1.5 times book value.
-     * This conservative formula is best suited for stable, mature companies.
+     * @return array{
+     *     fair_value: ?float,
+     *     margin_of_safety: ?float,
+     *     method: string,
+     *     warnings: string[],
+     *     can_value: bool,
+     * }
+     */
+    public function analyze(
+        float $eps,
+        float $bvps,
+        float $currentPrice,
+        float $der,
+        float $roe,
+        float $npm,
+    ): array {
+        $warnings = [];
+
+        // ---------------------------------------------------------------
+        // 1. Flag problematic metrics
+        // ---------------------------------------------------------------
+        if ($eps < 0) {
+            $warnings[] = 'EPS negatif — perusahaan sedang merugi.';
+        }
+        if ($bvps < 0) {
+            $warnings[] = 'BVPS negatif — ekuitas pemegang saham negatif (defisiensi modal).';
+        }
+        if ($roe < 0) {
+            $warnings[] = 'ROE negatif — perusahaan tidak menghasilkan keuntungan dari modal.';
+        }
+        if ($npm < 0) {
+            $warnings[] = 'NPM negatif — perusahaan merugi secara operasional.';
+        }
+        if ($npm > 100) {
+            $warnings[] = 'NPM di atas 100% — kemungkinan ada keuntungan non-operasional (one-time gain).';
+        }
+        if ($der > 2) {
+            $warnings[] = 'DER sangat tinggi (>' . number_format($der, 2) . ') — risiko kebangkrutan lebih besar.';
+        }
+
+        // ---------------------------------------------------------------
+        // 2. Try Graham Number (requires both EPS > 0 AND BVPS > 0)
+        // ---------------------------------------------------------------
+        if ($eps > 0 && $bvps > 0) {
+            $fairValue = $this->calculateGrahamNumber($eps, $bvps);
+            $mos = $this->calculateMarginOfSafety($currentPrice, $fairValue);
+
+            return [
+                'fair_value'       => $fairValue,
+                'margin_of_safety' => $mos,
+                'method'           => 'Graham Number',
+                'warnings'         => $warnings,
+                'can_value'        => true,
+            ];
+        }
+
+        // ---------------------------------------------------------------
+        // 3. Fallback: PBV-based valuation (only needs BVPS > 0)
+        // ---------------------------------------------------------------
+        if ($bvps > 0) {
+            $fairValue = $this->calculatePbvFairValue($bvps);
+            $mos = $this->calculateMarginOfSafety($currentPrice, $fairValue);
+
+            $warnings[] = 'Graham Number tidak dapat dihitung (EPS ≤ 0). Menggunakan metode PBV sebagai alternatif.';
+
+            return [
+                'fair_value'       => $fairValue,
+                'margin_of_safety' => $mos,
+                'method'           => 'PBV Analysis',
+                'warnings'         => $warnings,
+                'can_value'        => true,
+            ];
+        }
+
+        // ---------------------------------------------------------------
+        // 4. Cannot value: both EPS and BVPS are negative
+        // ---------------------------------------------------------------
+        $warnings[] = 'EPS dan BVPS keduanya negatif — tidak ada metode valuasi yang berlaku.';
+
+        return [
+            'fair_value'       => null,
+            'margin_of_safety' => null,
+            'method'           => 'Tidak Dapat Divaluasi',
+            'warnings'         => $warnings,
+            'can_value'        => false,
+        ];
+    }
+
+    /**
+     * Graham Number = sqrt(22.5 × EPS × BVPS)
      *
-     * @param float $eps Earnings Per Share (annual net income ÷ outstanding shares)
-     * @param float $bvps Book Value Per Share (total equity ÷ outstanding shares)
-     * @return float|null Graham Number (intrinsic value) or null if calculation impossible
-     *
-     * Example:
-     * - EPS: $5.00, BVPS: $12.00
-     * - Graham Number = √(22.5 × 5 × 12) = √1350 ≈ $36.74
+     * Classic Benjamin Graham formula.
+     * The constant 22.5 = 15 (max PE) × 1.5 (max PBV).
      */
     public function calculateGrahamNumber(float $eps, float $bvps): ?float
     {
-        // Edge case: Cannot calculate square root of negative number
         if ($eps <= 0 || $bvps <= 0) {
-            Log::warning('ValuationEngine: Invalid EPS or BVPS for Graham Number calculation', [
-                'eps' => $eps,
-                'bvps' => $bvps,
-            ]);
             return null;
         }
 
-        try {
-            // Graham Formula: √(22.5 × EPS × BVPS)
-            $grahamNumber = sqrt(22.5 * $eps * $bvps);
-
-            return round($grahamNumber, 2);
-        } catch (\Exception $e) {
-            Log::error('ValuationEngine: Error calculating Graham Number', [
-                'eps' => $eps,
-                'bvps' => $bvps,
-                'exception' => $e->getMessage(),
-            ]);
-            return null;
-        }
+        return round(sqrt(22.5 * $eps * $bvps), 2);
     }
 
     /**
-     * Calculate Margin of Safety (MoS)
+     * PBV-based Fair Value (fallback for negative-EPS companies).
      *
-     * Margin of Safety = ((Fair Value - Current Price) / Fair Value) × 100
+     * Uses conservative PBV = 1.0 as fair value benchmark.
+     * If stock trades at PBV < 1.0, it's below book value (potentially undervalued).
+     * If PBV > 1.5, it's trading at premium (potentially overvalued).
      *
-     * MoS represents the buffer between the stock's current price and its intrinsic value.
-     * A higher MoS indicates a safer investment with less downside risk.
-     *
-     * Formula Interpretation:
-     * - MoS > 30%: Stock is trading at significant discount (GOOD)
-     * - MoS 0-30%: Stock is fairly valued
-     * - MoS < 0%: Stock is overvalued (NOT RECOMMENDED)
-     *
-     * @param float $currentPrice Current market price of the stock
-     * @param float $fairValue Calculated intrinsic/fair value of the stock
-     * @return float Margin of Safety as a percentage (can be negative)
-     *
-     * Example:
-     * - Fair Value: $50.00, Current Price: $35.00
-     * - MoS = ((50 - 35) / 50) × 100 = 30%
+     * Fair Value = BVPS × 1.0 (conservative: price = book value)
      */
-    public function calculateMarginOfSafety(float $currentPrice, float $fairValue): float
+    public function calculatePbvFairValue(float $bvps): ?float
     {
-        // Prevent division by zero
-        if ($fairValue === 0.0) {
-            Log::warning('ValuationEngine: Fair value is zero, cannot calculate MoS', [
-                'current_price' => $currentPrice,
-                'fair_value' => $fairValue,
-            ]);
-            return 0.0;
-        }
-
-        // MoS = ((Fair Value - Current Price) / Fair Value) × 100
-        $marginOfSafety = (($fairValue - $currentPrice) / $fairValue) * 100;
-
-        return round($marginOfSafety, 2);
-    }
-
-    /**
-     * Calculate Fair Value using PEG Ratio method (alternative valuation)
-     *
-     * This is an optional helper method for additional valuation perspective.
-     *
-     * @param float $earnings Trailing twelve-month earnings
-     * @param float $growthRate Expected annual growth rate (as decimal, e.g., 0.10 for 10%)
-     * @return float|null Fair value estimate or null on invalid input
-     */
-    public function calculatePEGBasedValue(float $earnings, float $growthRate): ?float
-    {
-        if ($earnings <= 0 || $growthRate < 0) {
-            Log::warning('ValuationEngine: Invalid earnings or growth rate for PEG valuation', [
-                'earnings' => $earnings,
-                'growth_rate' => $growthRate,
-            ]);
+        if ($bvps <= 0) {
             return null;
         }
 
-        // Simple PEG: Fair Value = (Earnings × (1 + Growth Rate × PE Ratio)) / Discount Rate
-        $peRatio = 15; // Conservative baseline PE ratio
-        $discountRate = 0.10; // 10% required rate of return
+        // Conservative: fair price = 1× book value for loss-making companies
+        return round($bvps * 1.0, 2);
+    }
 
-        $fairValue = ($earnings * $peRatio * (1 + $growthRate)) / $discountRate;
+    /**
+     * Margin of Safety = ((Fair Value - Price) / Fair Value) × 100
+     */
+    public function calculateMarginOfSafety(float $currentPrice, ?float $fairValue): float
+    {
+        if ($fairValue === null || $fairValue === 0.0) {
+            return -100.0; // Worst case
+        }
 
-        return round($fairValue, 2);
+        return round((($fairValue - $currentPrice) / $fairValue) * 100, 2);
     }
 }

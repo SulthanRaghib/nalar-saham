@@ -4,214 +4,121 @@ declare(strict_types=1);
 
 namespace App\Services;
 
-use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Log;
+use App\Contracts\StockDataProvider;
+use App\Services\Providers\IdxProvider;
+use App\Services\Providers\YahooFinanceProvider;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 
 /**
- * StockApiService
+ * StockApiService — Orchestrator
  *
- * Professional service layer for fetching stock fundamental data.
- *
- * Strategy:
- * - Uses Alpha Vantage API (reliable, global coverage)
- * - Implements 5-minute caching to stay within free tier limits
- * - Falls back to manual input when API fails
+ * Manages a chain of stock data providers with automatic fallback.
+ * Provider priority: IDX Indonesia → Yahoo Finance → null (manual input)
  *
  * Features:
- * - EPS, BVPS, ROE, DER, NPM extraction
- * - Automatic data caching
- * - Comprehensive error logging
+ * - Multi-provider fallback chain
+ * - 5-minute caching to reduce API load
+ * - Transparent provider switching with logging
+ * - Clean interface-based architecture
  *
  * @package App\Services
- * @version 3.1.0
- * @since 2026-04-02
  */
 class StockApiService
 {
     private const CACHE_TTL = 300; // 5 minutes
-    private const API_TIMEOUT = 15;
 
-    private readonly string $alphaVantageKey;
-    private readonly string $alphaVantageUrl;
-    private readonly int $timeout;
+    /** @var StockDataProvider[] */
+    private array $providers;
 
     public function __construct()
     {
-        $this->alphaVantageKey = config('services.alpha_vantage.key', 'demo');
-        $this->alphaVantageUrl = config('services.alpha_vantage.base_url', 'https://www.alphavantage.co');
-        $this->timeout = config('services.alpha_vantage.timeout', self::API_TIMEOUT);
+        $this->providers = [
+            new IdxProvider(),
+            new YahooFinanceProvider(),
+        ];
     }
 
     /**
-     * Fetch fundamental stock data
+     * Fetch fundamental stock data.
      *
-     * @param string $ticker Stock symbol (e.g., "AAPL", "MSFT", "BBCA")
-     * @return array|null Standardized fundamental data or null on failure
+     * Iterates through all registered providers until one succeeds.
+     * Results are cached for 5 minutes to reduce API load.
      *
-     * Returns array with keys:
-     * - ticker: normalized ticker
-     * - eps: earnings per share
-     * - bvps: book value per share
-     * - roe: return on equity (%)
-     * - der: debt-to-equity ratio
-     * - npm: net profit margin (%)
-     * - current_price: current stock price (usually null - provide manually)
-     * - source: which API provided the data
+     * @param string $ticker Stock ticker (e.g., "BBCA", "TLKM", "BBRI")
+     * @return array|null Standardized fundamental data or null if all providers fail
      */
     public function fetchFundamentalData(string $ticker): ?array
     {
-        try {
-            $ticker = $this->sanitizeTicker($ticker);
+        $ticker = $this->sanitizeTicker($ticker);
 
-            if (empty($ticker)) {
-                Log::warning('StockApiService: Empty ticker');
-                return null;
-            }
-
-            // Check cache first
-            $cacheKey = $this->getCacheKey($ticker);
-            $cached = Cache::get($cacheKey);
-            if ($cached !== null) {
-                Log::info("StockApiService: Cache hit for {$ticker}");
-                return $cached;
-            }
-
-            // Fetch from API
-            Log::info("StockApiService: Fetching {$ticker} from Alpha Vantage");
-            $data = $this->fetchFromAlphaVantage($ticker);
-
-            if ($data === null) {
-                Log::warning("StockApiService: Failed to fetch {$ticker}. " .
-                    "Register real key at https://www.alphavantage.co/ or use manual input.");
-                return null;
-            }
-
-            // Cache the result
-            Cache::put($cacheKey, $data, self::CACHE_TTL);
-            Log::info("StockApiService: Successfully cached {$ticker}");
-
-            return $data;
-        } catch (\Exception $e) {
-            Log::error("StockApiService: Error for {$ticker}: " . $e->getMessage());
+        if (empty($ticker)) {
+            Log::warning('StockApiService: Empty ticker provided');
             return null;
         }
-    }
 
-    /**
-     * Fetch from Alpha Vantage OVERVIEW endpoint
-     *
-     * https://www.alphavantage.co/documentation/#overview
-     * Provides: EPS, BookValue, ROE, Dividend, DividendShare, DER, ProfitMargin
-     */
-    private function fetchFromAlphaVantage(string $ticker): ?array
-    {
-        try {
-            $response = Http::timeout($this->timeout)->get("{$this->alphaVantageUrl}/query", [
-                'function' => 'OVERVIEW',
-                'symbol' => $ticker,
-                'apikey' => $this->alphaVantageKey,
-            ]);
+        // Check cache
+        $cacheKey = "stock_fundamental:{$ticker}";
+        $cached = Cache::get($cacheKey);
 
-            if (!$response->successful()) {
-                Log::warning("StockApiService: Alpha Vantage HTTP {$response->status()} for {$ticker}");
-                return null;
-            }
-
-            $data = $response->json();
-
-            // Check for API errors
-            if (isset($data['Error Message']) || isset($data['Note'])) {
-                Log::warning("StockApiService: Alpha Vantage error for {$ticker}: " .
-                    ($data['Error Message'] ?? $data['Note']));
-                return null;
-            }
-
-            // Must have EPS for Graham Number calculation
-            if (!isset($data['EPS']) || empty($data['EPS'])) {
-                Log::warning("StockApiService: Alpha Vantage missing EPS for {$ticker}");
-                return null;
-            }
-
-            return $this->transformAlphaVantageResponse($ticker, $data);
-        } catch (\Exception $e) {
-            Log::warning("StockApiService: Alpha Vantage exception for {$ticker}: " . $e->getMessage());
-            return null;
+        if ($cached !== null) {
+            Log::info("StockApiService: Cache hit for {$ticker} (source: {$cached['source']})");
+            return $cached;
         }
-    }
 
-    /**
-     * Transform Alpha Vantage response to standard format
-     */
-    private function transformAlphaVantageResponse(string $ticker, array $data): ?array
-    {
-        try {
-            // Clean ticker
-            $ticker = str_replace('.JK', '', strtoupper(trim($ticker)));
-
-            // Extract metrics
-            $eps = $this->toFloat($data['EPS'] ?? 0);
-            $bvps = $this->toFloat($data['BookValue'] ?? 0);
-            $roe = $this->toFloat($data['ReturnOnEquityTTM'] ?? 0);
-            $der = $this->toFloat($data['DebtToEquity'] ?? 0);
-            $npm = $this->toFloat($data['ProfitMargin'] ?? 0);
-
-            // Convert decimals to percentages if needed
-            if ($roe > 0 && $roe < 1) {
-                $roe *= 100;
-            }
-            if ($npm > 0 && $npm < 1) {
-                $npm *= 100;
+        // Try each provider in order
+        foreach ($this->providers as $provider) {
+            if (!$provider->supports($ticker)) {
+                Log::debug("StockApiService: {$provider->getProviderName()} does not support {$ticker}, skipping");
+                continue;
             }
 
-            return [
-                'ticker' => $ticker,
-                'eps' => $eps,
-                'bvps' => $bvps,
-                'roe' => $roe,
-                'der' => $der,
-                'npm' => $npm,
-                'current_price' => null, // Provide manually in UI
-                'source' => 'alpha_vantage',
-            ];
-        } catch (\Exception $e) {
-            Log::error("StockApiService: Transform error: " . $e->getMessage());
-            return null;
+            Log::info("StockApiService: Trying {$provider->getProviderName()} for {$ticker}");
+
+            try {
+                $data = $provider->fetchFundamentalData($ticker);
+
+                if ($data !== null) {
+                    Log::info("StockApiService: ✓ {$provider->getProviderName()} returned data for {$ticker}");
+                    Cache::put($cacheKey, $data, self::CACHE_TTL);
+                    return $data;
+                }
+
+                Log::info("StockApiService: ✗ {$provider->getProviderName()} returned null for {$ticker}");
+            } catch (\Exception $e) {
+                Log::error("StockApiService: {$provider->getProviderName()} threw exception for {$ticker}: " . $e->getMessage());
+            }
         }
+
+        Log::warning("StockApiService: All providers failed for {$ticker}. Manual input required.");
+        return null;
     }
 
     /**
-     * Convert value to float safely
-     */
-    private function toFloat($value): float
-    {
-        if (is_numeric($value)) {
-            return (float) $value;
-        }
-        return 0.0;
-    }
-
-    /**
-     * Normalize ticker input
-     */
-    private function sanitizeTicker(string $ticker): string
-    {
-        return trim(strtoupper($ticker));
-    }
-
-    /**
-     * Generate cache key for ticker
-     */
-    private function getCacheKey(string $ticker): string
-    {
-        return "stock_data:{$ticker}";
-    }
-
-    /**
-     * Clear cache for ticker (force fresh fetch)
+     * Clear cached data for a ticker.
      */
     public function clearCache(string $ticker): void
     {
-        Cache::forget($this->getCacheKey($ticker));
+        $ticker = $this->sanitizeTicker($ticker);
+        Cache::forget("stock_fundamental:{$ticker}");
+    }
+
+    /**
+     * Normalize and sanitize ticker input.
+     *
+     * - Strips .JK suffix (we add it internally when needed)
+     * - Converts to uppercase
+     * - Trims whitespace
+     */
+    private function sanitizeTicker(string $ticker): string
+    {
+        $ticker = trim(strtoupper($ticker));
+
+        // Remove .JK suffix — used only internally by Yahoo Finance provider
+        if (str_ends_with($ticker, '.JK')) {
+            $ticker = substr($ticker, 0, -3);
+        }
+
+        return $ticker;
     }
 }
