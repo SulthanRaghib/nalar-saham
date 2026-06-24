@@ -69,6 +69,90 @@ class IdxProvider implements StockDataProvider
         }
     }
 
+    /**
+     * Fetch trading data: price, volume, value, foreign flow.
+     */
+    public function fetchTradingData(string $ticker): ?array
+    {
+        $ticker = $this->normalizeTicker($ticker);
+
+        try {
+            $stockSummary = $this->fetchStockSummaryData($ticker);
+
+            if ($stockSummary === null) {
+                Log::warning("IdxProvider: No trading data for {$ticker}");
+                return null;
+            }
+
+            $close = $this->safeFloat($stockSummary['Close'] ?? $stockSummary['close'] ?? null);
+            $previous = $this->safeFloat($stockSummary['Previous'] ?? $stockSummary['previous'] ?? null);
+            $open = $this->safeFloat($stockSummary['OpenPrice'] ?? $stockSummary['openPrice'] ?? null);
+            $high = $this->safeFloat($stockSummary['High'] ?? $stockSummary['high'] ?? null);
+            $low = $this->safeFloat($stockSummary['Low'] ?? $stockSummary['low'] ?? null);
+            $volume = $this->safeFloat($stockSummary['Volume'] ?? $stockSummary['volume'] ?? null);
+            $value = $this->safeFloat($stockSummary['Value'] ?? $stockSummary['value'] ?? null);
+            $frequency = $this->safeFloat($stockSummary['Frequency'] ?? $stockSummary['frequency'] ?? null);
+            $foreignBuy = $this->safeFloat($stockSummary['ForeignBuy'] ?? $stockSummary['foreignBuy'] ?? null);
+            $foreignSell = $this->safeFloat($stockSummary['ForeignSell'] ?? $stockSummary['foreignSell'] ?? null);
+            $listedShares = $this->safeFloat($stockSummary['ListedShares'] ?? $stockSummary['listedShares'] ?? null);
+
+            $change = ($close !== null && $previous !== null) ? ($close - $previous) : null;
+            $changePercent = ($previous !== null && $previous > 0 && $change !== null)
+                ? round(($change / $previous) * 100, 2)
+                : null;
+
+            $netForeign = ($foreignBuy !== null && $foreignSell !== null)
+                ? ($foreignBuy - $foreignSell)
+                : null;
+
+            $marketCap = ($close !== null && $listedShares !== null)
+                ? ($close * $listedShares)
+                : null;
+
+            // Estimate domestic/ritel flow from total vs foreign
+            $netRitel = null;
+            if ($value !== null && $netForeign !== null) {
+                $netRitel = -$netForeign; // Simplified: ritel is inverse of foreign net
+            }
+
+            return [
+                'ticker'          => strtoupper($ticker),
+                'open'            => $open,
+                'high'            => $high,
+                'low'             => $low,
+                'close'           => $close,
+                'previous'        => $previous,
+                'change'          => $change,
+                'change_percent'  => $changePercent,
+                'volume'          => $volume,
+                'value'           => $value,
+                'frequency'       => $frequency,
+                'foreign_buy'     => $foreignBuy,
+                'foreign_sell'    => $foreignSell,
+                'net_foreign'     => $netForeign,
+                'net_ritel'       => $netRitel,
+                'listed_shares'   => $listedShares,
+                'market_cap'      => $marketCap,
+                'source'          => 'idx',
+            ];
+        } catch (\Exception $e) {
+            Log::error("IdxProvider: Trading data exception for {$ticker}: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Fetch historical OHLCV data.
+     * IDX doesn't have a direct historical endpoint, so return null.
+     * Yahoo Finance provider handles this.
+     */
+    public function fetchHistoricalPrices(string $ticker, int $days = 90): ?array
+    {
+        // IDX internal API doesn't provide historical OHLCV data
+        // This will be handled by Yahoo Finance provider as fallback
+        return null;
+    }
+
     public function supports(string $ticker): bool
     {
         $ticker = $this->normalizeTicker($ticker);
@@ -79,6 +163,40 @@ class IdxProvider implements StockDataProvider
     public function getProviderName(): string
     {
         return 'IDX Indonesia';
+    }
+
+    /**
+     * Fetch the raw stock summary data for a single ticker.
+     */
+    private function fetchStockSummaryData(string $ticker): ?array
+    {
+        try {
+            $response = Http::timeout(self::TIMEOUT)
+                ->withHeaders($this->getHeaders())
+                ->get(self::BASE_URL . '/TradingSummary/GetStockSummary', [
+                    'length' => 9999,
+                    'start'  => 0,
+                ]);
+
+            if (!$response->successful()) {
+                return null;
+            }
+
+            $data = $response->json();
+            $stocks = $data['data'] ?? $data['Data'] ?? [];
+
+            foreach ($stocks as $stock) {
+                $code = strtoupper(trim($stock['StockCode'] ?? $stock['stockCode'] ?? ''));
+                if ($code === strtoupper($ticker)) {
+                    return $stock;
+                }
+            }
+
+            return null;
+        } catch (\Exception $e) {
+            Log::debug("IdxProvider: Stock summary fetch error for {$ticker}: " . $e->getMessage());
+            return null;
+        }
     }
 
     /**
@@ -190,33 +308,13 @@ class IdxProvider implements StockDataProvider
      */
     private function fetchCurrentPrice(string $ticker): ?float
     {
-        try {
-            $response = Http::timeout(self::TIMEOUT)
-                ->withHeaders($this->getHeaders())
-                ->get(self::BASE_URL . '/TradingSummary/GetStockSummary', [
-                    'length' => 9999,
-                    'start'  => 0,
-                ]);
+        $summary = $this->fetchStockSummaryData($ticker);
 
-            if (!$response->successful()) {
-                return null;
-            }
-
-            $data = $response->json();
-            $stocks = $data['data'] ?? $data['Data'] ?? [];
-
-            foreach ($stocks as $stock) {
-                $code = strtoupper(trim($stock['StockCode'] ?? $stock['stockCode'] ?? ''));
-                if ($code === strtoupper($ticker)) {
-                    return $this->safeFloat($stock['Close'] ?? $stock['close'] ?? $stock['Previous'] ?? null);
-                }
-            }
-
-            return null;
-        } catch (\Exception $e) {
-            Log::debug("IdxProvider: Stock price fetch error for {$ticker}: " . $e->getMessage());
+        if ($summary === null) {
             return null;
         }
+
+        return $this->safeFloat($summary['Close'] ?? $summary['close'] ?? $summary['Previous'] ?? null);
     }
 
     /**

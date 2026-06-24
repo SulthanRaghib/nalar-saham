@@ -18,7 +18,7 @@ use Illuminate\Support\Facades\Log;
  *
  * Features:
  * - Multi-provider fallback chain
- * - 5-minute caching to reduce API load
+ * - Differentiated caching: fundamental (5min), trading (2min), historical (1hr)
  * - Transparent provider switching with logging
  * - Clean interface-based architecture
  *
@@ -26,7 +26,9 @@ use Illuminate\Support\Facades\Log;
  */
 class StockApiService
 {
-    private const CACHE_TTL = 300; // 5 minutes
+    private const CACHE_TTL_FUNDAMENTAL = 300;  // 5 minutes
+    private const CACHE_TTL_TRADING = 120;       // 2 minutes
+    private const CACHE_TTL_HISTORICAL = 3600;   // 1 hour
 
     /** @var StockDataProvider[] */
     private array $providers;
@@ -80,7 +82,7 @@ class StockApiService
 
                 if ($data !== null) {
                     Log::info("StockApiService: ✓ {$provider->getProviderName()} returned data for {$ticker}");
-                    Cache::put($cacheKey, $data, self::CACHE_TTL);
+                    Cache::put($cacheKey, $data, self::CACHE_TTL_FUNDAMENTAL);
                     return $data;
                 }
 
@@ -95,12 +97,100 @@ class StockApiService
     }
 
     /**
+     * Fetch trading data for today (price, volume, value, foreign flow).
+     *
+     * @param string $ticker Stock ticker
+     * @return array|null Trading data or null if all providers fail
+     */
+    public function fetchTradingData(string $ticker): ?array
+    {
+        $ticker = $this->sanitizeTicker($ticker);
+
+        if (empty($ticker)) {
+            return null;
+        }
+
+        $cacheKey = "stock_trading:{$ticker}";
+        $cached = Cache::get($cacheKey);
+
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        foreach ($this->providers as $provider) {
+            if (!$provider->supports($ticker)) {
+                continue;
+            }
+
+            try {
+                $data = $provider->fetchTradingData($ticker);
+
+                if ($data !== null) {
+                    Log::info("StockApiService: ✓ Trading data from {$provider->getProviderName()} for {$ticker}");
+                    Cache::put($cacheKey, $data, self::CACHE_TTL_TRADING);
+                    return $data;
+                }
+            } catch (\Exception $e) {
+                Log::error("StockApiService: Trading data error from {$provider->getProviderName()} for {$ticker}: " . $e->getMessage());
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Fetch historical OHLCV data for technical analysis.
+     *
+     * @param string $ticker Stock ticker
+     * @param int    $days   Number of days of history
+     * @return array|null Array of candles or null if all providers fail
+     */
+    public function fetchHistoricalPrices(string $ticker, int $days = 90): ?array
+    {
+        $ticker = $this->sanitizeTicker($ticker);
+
+        if (empty($ticker)) {
+            return null;
+        }
+
+        $cacheKey = "stock_historical:{$ticker}:{$days}";
+        $cached = Cache::get($cacheKey);
+
+        if ($cached !== null) {
+            Log::info("StockApiService: Cache hit for historical {$ticker} ({$days} days)");
+            return $cached;
+        }
+
+        foreach ($this->providers as $provider) {
+            if (!$provider->supports($ticker)) {
+                continue;
+            }
+
+            try {
+                $data = $provider->fetchHistoricalPrices($ticker, $days);
+
+                if ($data !== null && count($data) > 0) {
+                    Log::info("StockApiService: ✓ Historical data from {$provider->getProviderName()} for {$ticker} (" . count($data) . " candles)");
+                    Cache::put($cacheKey, $data, self::CACHE_TTL_HISTORICAL);
+                    return $data;
+                }
+            } catch (\Exception $e) {
+                Log::error("StockApiService: Historical data error from {$provider->getProviderName()} for {$ticker}: " . $e->getMessage());
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Clear cached data for a ticker.
      */
     public function clearCache(string $ticker): void
     {
         $ticker = $this->sanitizeTicker($ticker);
         Cache::forget("stock_fundamental:{$ticker}");
+        Cache::forget("stock_trading:{$ticker}");
+        Cache::forget("stock_historical:{$ticker}:90");
     }
 
     /**

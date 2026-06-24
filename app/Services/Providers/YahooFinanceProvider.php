@@ -13,6 +13,7 @@ use Illuminate\Support\Facades\Log;
  *
  * Uses Yahoo Finance's unofficial API as a fallback when IDX API is unavailable.
  * Supports Indonesian stocks (.JK) and US/global stocks.
+ * Also provides historical OHLCV data for technical analysis.
  *
  * @package App\Services\Providers
  */
@@ -40,6 +41,157 @@ class YahooFinanceProvider implements StockDataProvider
             return $this->fetchFromChart($yahooTicker, $ticker);
         } catch (\Exception $e) {
             Log::error("YahooFinanceProvider: Exception for {$ticker}: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Fetch trading data (current day OHLCV + change).
+     */
+    public function fetchTradingData(string $ticker): ?array
+    {
+        $yahooTicker = $this->toYahooTicker($ticker);
+
+        try {
+            $response = Http::timeout(self::TIMEOUT)
+                ->withHeaders(['User-Agent' => self::USER_AGENT])
+                ->get(self::CHART_URL . "/{$yahooTicker}", [
+                    'range'    => '1d',
+                    'interval' => '1m',
+                ]);
+
+            if (!$response->successful()) {
+                return null;
+            }
+
+            $json = $response->json();
+            $result = $json['chart']['result'][0] ?? null;
+
+            if ($result === null) {
+                return null;
+            }
+
+            $meta = $result['meta'] ?? [];
+            $close = (float) ($meta['regularMarketPrice'] ?? 0);
+            $previous = (float) ($meta['chartPreviousClose'] ?? $meta['previousClose'] ?? 0);
+            $volume = (int) ($meta['regularMarketVolume'] ?? 0);
+
+            // Get intraday OHLC
+            $quotes = $result['indicators']['quote'][0] ?? [];
+            $highs = array_filter($quotes['high'] ?? [], fn($v) => $v !== null);
+            $lows = array_filter($quotes['low'] ?? [], fn($v) => $v !== null);
+            $opens = array_filter($quotes['open'] ?? [], fn($v) => $v !== null);
+
+            $high = !empty($highs) ? max($highs) : $close;
+            $low = !empty($lows) ? min($lows) : $close;
+            $open = !empty($opens) ? reset($opens) : $close;
+
+            $change = $close - $previous;
+            $changePercent = $previous > 0 ? round(($change / $previous) * 100, 2) : 0;
+
+            $originalTicker = str_replace('.JK', '', strtoupper($yahooTicker));
+
+            return [
+                'ticker'          => $originalTicker,
+                'open'            => round($open, 2),
+                'high'            => round($high, 2),
+                'low'             => round($low, 2),
+                'close'           => round($close, 2),
+                'previous'        => round($previous, 2),
+                'change'          => round($change, 2),
+                'change_percent'  => $changePercent,
+                'volume'          => $volume,
+                'value'           => null, // Yahoo doesn't provide value directly
+                'frequency'       => null,
+                'foreign_buy'     => null, // Not available from Yahoo
+                'foreign_sell'    => null,
+                'net_foreign'     => null,
+                'net_ritel'       => null,
+                'listed_shares'   => null,
+                'market_cap'      => null,
+                'source'          => 'yahoo_finance',
+            ];
+        } catch (\Exception $e) {
+            Log::error("YahooFinanceProvider: Trading data exception for {$ticker}: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Fetch historical OHLCV data for technical analysis.
+     */
+    public function fetchHistoricalPrices(string $ticker, int $days = 90): ?array
+    {
+        $yahooTicker = $this->toYahooTicker($ticker);
+
+        try {
+            // Map days to Yahoo range parameter
+            $range = match (true) {
+                $days <= 5   => '5d',
+                $days <= 30  => '1mo',
+                $days <= 90  => '3mo',
+                $days <= 180 => '6mo',
+                default      => '1y',
+            };
+
+            $response = Http::timeout(self::TIMEOUT)
+                ->withHeaders(['User-Agent' => self::USER_AGENT])
+                ->get(self::CHART_URL . "/{$yahooTicker}", [
+                    'range'    => $range,
+                    'interval' => '1d',
+                ]);
+
+            if (!$response->successful()) {
+                Log::debug("YahooFinanceProvider: Historical data HTTP {$response->status()} for {$yahooTicker}");
+                return null;
+            }
+
+            $json = $response->json();
+            $result = $json['chart']['result'][0] ?? null;
+
+            if ($result === null) {
+                return null;
+            }
+
+            $timestamps = $result['timestamp'] ?? [];
+            $quotes = $result['indicators']['quote'][0] ?? [];
+
+            if (empty($timestamps) || empty($quotes)) {
+                return null;
+            }
+
+            $candles = [];
+
+            foreach ($timestamps as $i => $ts) {
+                $open = $quotes['open'][$i] ?? null;
+                $high = $quotes['high'][$i] ?? null;
+                $low = $quotes['low'][$i] ?? null;
+                $close = $quotes['close'][$i] ?? null;
+                $volume = $quotes['volume'][$i] ?? null;
+
+                // Skip null candles
+                if ($open === null || $close === null) {
+                    continue;
+                }
+
+                $candles[] = [
+                    'date'   => date('Y-m-d', $ts),
+                    'open'   => round((float) $open, 2),
+                    'high'   => round((float) ($high ?? $open), 2),
+                    'low'    => round((float) ($low ?? $open), 2),
+                    'close'  => round((float) $close, 2),
+                    'volume' => (int) ($volume ?? 0),
+                ];
+            }
+
+            if (empty($candles)) {
+                return null;
+            }
+
+            Log::info("YahooFinanceProvider: Fetched " . count($candles) . " candles for {$yahooTicker}");
+            return $candles;
+        } catch (\Exception $e) {
+            Log::error("YahooFinanceProvider: Historical data exception for {$ticker}: " . $e->getMessage());
             return null;
         }
     }
